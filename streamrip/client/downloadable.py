@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 from abc import ABC, abstractmethod
@@ -386,27 +387,45 @@ class TidalDASHDownloadable(TidalDownloadable):
                     await f.write(chunk)
                     callback(len(chunk))
 
-        # Remux the MP4 container to FLAC. "-c copy" is a stream copy, so the
-        # audio is bit-identical -- only the container changes.
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-i", tmp_path, "-c", "copy", "-y", path,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
+        await _remux_to_flac(tmp_path, path)
 
-        if proc.returncode != 0 or not os.path.isfile(path):
-            # Without this a failed remux is silent: the temp file is removed,
-            # no output is written, and the caller treats the download as
-            # successful -- on current dev that records the track as
-            # downloaded, so it is skipped on every future run.
-            os.remove(tmp_path)
-            raise NonStreamableError(
-                f"ffmpeg failed to remux Tidal DASH stream "
-                f"(exit {proc.returncode}): {stderr.decode(errors='replace')[-300:]}"
-            )
 
+async def _remux_to_flac(tmp_path: str, path: str) -> None:
+    """Remux an MP4 container holding FLAC into a plain .flac file.
+
+    "-c copy" is a stream copy, so the audio is bit-identical -- only the
+    container changes.
+
+    ffmpeg runs in a worker thread rather than through
+    asyncio.create_subprocess_exec. On Windows streamrip installs
+    WindowsSelectorEventLoopPolicy (aiodns requires it), and the selector loop
+    cannot start subprocesses at all, so the asyncio version fails before
+    ffmpeg ever runs. Switching to the Proactor loop instead breaks aiodns. A
+    thread works on every loop and still leaves the event loop free while
+    ffmpeg runs. -nostdin stops ffmpeg reading the terminal, which would
+    otherwise swallow input meant for streamrip's own prompts.
+    """
+    result = await asyncio.to_thread(
+        subprocess.run,
+        ["ffmpeg", "-nostdin", "-i", tmp_path, "-c", "copy", "-y", path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+    if result.returncode != 0 or not os.path.isfile(path):
+        # Without this a failed remux is silent: the temp file is removed,
+        # no output is written, and the caller treats the download as
+        # successful -- on current dev that records the track as
+        # downloaded, so it is skipped on every future run.
         os.remove(tmp_path)
+        raise NonStreamableError(
+            f"ffmpeg failed to remux Tidal DASH stream "
+            f"(exit {result.returncode}): "
+            f"{result.stderr.decode(errors='replace')[-300:]}"
+        )
+
+    os.remove(tmp_path)
+
 
 class SoundcloudDownloadable(Downloadable):
     def __init__(self, session, info: dict):
